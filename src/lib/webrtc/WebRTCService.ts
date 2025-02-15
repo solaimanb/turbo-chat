@@ -1,118 +1,132 @@
 import Peer from "simple-peer";
-import { Socket } from "socket.io-client";
-
-interface CallSignalData {
-  fromUserId: string;
-  signal: Peer.SignalData;
-}
+import { SocketEvents } from "../SocketEvents";
+import { useCallStore } from "@/store/callStore";
 
 class WebRTCService {
   private peer: Peer.Instance | null = null;
-  private localStream: MediaStream | null = null;
-  private socket: Socket;
+  private socketEvents: SocketEvents;
 
-  constructor(socket: Socket) {
-    this.socket = socket;
+  constructor(socketEvents: SocketEvents) {
+    this.socketEvents = socketEvents;
   }
 
   async startCall(remoteUserId: string, isInitiator: boolean): Promise<void> {
     try {
-      // Validate STUN/TURN configuration
       const iceServers: RTCIceServer[] = [
         { urls: "stun:stun.l.google.com:19302" },
         {
-          urls: "turn:relay1.expressturn.com:3478",
-          username: "efQZWEG6AZABVUX9JK",
-          credential: "9KyTq00gxMPtl3DV",
+          urls: process.env.NEXT_PUBLIC_TURN_SERVER_URL!,
+          username: process.env.NEXT_PUBLIC_TURN_SERVER_USERNAME!,
+          credential: process.env.NEXT_PUBLIC_TURN_SERVER_CREDENTIAL!,
         },
       ];
-      console.log("Using ICE servers:", iceServers);
+      console.log("ICE servers:", iceServers);
 
       // Get user media (microphone)
-      this.localStream = await navigator.mediaDevices.getUserMedia({
+      const localStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
       });
+
+      useCallStore.getState().setLocalStream(localStream);
+      console.log(
+        "Local stream obtained at - Get user media (microphone):",
+        localStream
+      );
 
       // Initialize WebRTC peer connection
       this.peer = new Peer({
         initiator: isInitiator,
         trickle: true,
-        stream: this.localStream,
-        config: { iceServers },
+        stream: localStream,
+        config: {
+          iceServers,
+          iceCandidatePoolSize: 10,
+        },
+      });
+
+      // Listen for generated ICE candidates
+      this.peer.on("icecandidate", (candidate) => {
+        console.log("Sending ICE candidate:", candidate);
+        this.socketEvents.sendIceCandidate(remoteUserId, candidate);
       });
 
       // Handle signaling data exchange via Socket.IO
       this.peer.on("signal", (data: Peer.SignalData) => {
         console.log("Sending WebRTC signal:", data);
-        this.socket.emit("call-signal", {
-          toUserId: remoteUserId,
-          signal: data,
-        });
+        this.socketEvents.sendCallSignal(remoteUserId, data);
       });
 
       // Handle remote stream
       this.peer.on("stream", (remoteStream: MediaStream) => {
         console.log("Remote stream received:", remoteStream);
-        const audioElement = document.getElementById(
-          "remote-audio"
-        ) as HTMLAudioElement;
-        if (audioElement) {
-          audioElement.srcObject = remoteStream;
-          audioElement.play().catch((err) => {
-            console.error("Error playing remote audio:", err);
-            alert("Audio playback failed. Please check your browser settings.");
-          });
-        } else {
-          console.error("Remote audio element not found");
-          alert("Audio playback failed. Please check your browser settings.");
-        }
+        console.log("Remote stream tracks:", remoteStream.getTracks());
+        useCallStore.getState().setRemoteStream(remoteStream);
+        useCallStore.getState().setCallStatus("connected");
       });
 
       // Handle peer errors
-      this.peer.on("error", (err) => {
-        console.error("WebRTC peer error:", err);
-        alert("An error occurred during the call. Please try again.");
+      this.peer.on("error", (err: Error) => {
+        console.error("WebRTC peer error:", err.message);
+        useCallStore.getState().setCallStatus("rejected");
       });
 
       // Listen for signaling data from the other peer
-      this.socket.off("call-signal");
-      this.socket.on(
-        "call-signal",
-        ({ fromUserId, signal }: CallSignalData) => {
-          console.log(`Received WebRTC signal from ${fromUserId}`);
-          if (this.peer && fromUserId === remoteUserId) {
-            this.peer.signal(signal);
-          }
+      this.socketEvents.onCallSignal(({ fromUserId, signal }) => {
+        console.log("Received call signal:", signal.type, signal);
+        if (this.peer && fromUserId === remoteUserId) {
+          this.peer.signal(signal);
         }
-      );
+      });
 
       // Listen for incoming ICE candidates
-      this.socket.on("ice-candidate", ({ candidate }) => {
+      this.socketEvents.onIceCandidate((candidate: RTCIceCandidateInit) => {
         console.log("Received ICE candidate:", candidate);
+
         if (this.peer) {
-          this.peer.signal(candidate);
+          const rtcIceCandidate = new RTCIceCandidate(candidate);
+          const signalData: Peer.SignalData = {
+            type: "candidate",
+            candidate: rtcIceCandidate,
+          };
+          this.peer.signal(signalData);
         }
+      });
+
+      // Additional debugging logs
+      this.peer.on("connect", () => {
+        console.log("✅ Connection established");
+        useCallStore.getState().setCallStatus("connected");
+      });
+      
+      this.peer.on("close", () => {
+        console.log("❌ Connection closed");
+        useCallStore.getState().setCallStatus("idle");
+      });
+
+      this.peer.on("data", (data) => {
+        console.log("Data channel message received:", data);
       });
     } catch (error) {
       console.error("Error starting call:", error);
-      alert("Failed to access microphone. Please check your permissions.");
+      useCallStore.getState().setCallStatus("rejected");
+      this.socketEvents.rejectCall(remoteUserId);
     }
   }
 
   endCall(): void {
-    if (this.localStream) {
-      this.localStream.getTracks().forEach((track) => track.stop());
-    }
     if (this.peer) {
+      this.peer.removeAllListeners("icecandidate");
       this.peer.destroy();
     }
-    this.peer = null;
-    this.localStream = null;
+    useCallStore.getState().setLocalStream(null);
+    useCallStore.getState().setRemoteStream(null);
+    useCallStore.getState().setCallStatus("idle");
   }
 
   toggleMute(): void {
-    if (this.localStream) {
-      const audioTracks = this.localStream.getAudioTracks();
+    const localStream = useCallStore.getState().localStream;
+    if (localStream) {
+      const audioTracks = localStream.getAudioTracks();
       if (audioTracks.length > 0) {
         audioTracks[0].enabled = !audioTracks[0].enabled;
         console.log("Audio track enabled:", audioTracks[0].enabled);
